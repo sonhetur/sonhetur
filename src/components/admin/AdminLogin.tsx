@@ -38,10 +38,15 @@ export default function AdminLogin({ onLoginSuccess, onBackToSite }: AdminLoginP
       const res = await dataProvider.login(email.trim(), password);
       onLoginSuccess(res.user);
     } catch (err: any) {
-      if (err.message && err.message.includes('não configurada')) {
+      const msg = err?.message || '';
+      if (msg.includes('não configurada') || msg.includes('primeiro acesso') || msg.includes('needsSetup')) {
         setIsFirstSetup(true);
       }
-      setErrorMessage(err.message || 'Falha ao autenticar. Verifique seus dados.');
+      if (msg.includes('The string did not match the expected pattern') || msg.includes('Unexpected token')) {
+        setErrorMessage('Servidor não retornou resposta no formato esperado. Verifique seus dados de acesso.');
+      } else {
+        setErrorMessage(msg || 'Falha ao autenticar. Verifique seus dados.');
+      }
     } finally {
       setIsLoading(false);
     }
@@ -65,7 +70,12 @@ export default function AdminLogin({ onLoginSuccess, onBackToSite }: AdminLoginP
       const res = await dataProvider.setupInitialPassword(setupPassword);
       onLoginSuccess(res.user);
     } catch (err: any) {
-      setErrorMessage(err.message || 'Erro ao definir senha inicial.');
+      const msg = err?.message || '';
+      if (msg.includes('The string did not match the expected pattern') || msg.includes('Unexpected token')) {
+        setErrorMessage('Falha de resposta do servidor ao configurar senha. Tente novamente.');
+      } else {
+        setErrorMessage(msg || 'Erro ao definir senha inicial.');
+      }
     } finally {
       setIsLoading(false);
     }

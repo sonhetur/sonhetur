@@ -9,6 +9,7 @@ import type {
   AdminUser,
   PublicDataResponse,
   AdminDataResponse,
+  DashboardStats,
 } from '../types/index.ts';
 
 const TOKEN_KEY = 'sonhetur_admin_token';
@@ -27,9 +28,11 @@ const defaultClientSettings: SiteSettings = {
 };
 
 const defaultClientContent: InstitutionalContent = {
-  slogan: 'Seu próximo destino começa aqui.',
-  homeMainText: 'Descubra novas experiências e encontre sua próxima viagem com a SonheTur.',
-  aboutText: 'A SonheTur atua no segmento de agência de viagens e turismo na região do Vale do Aço, Minas Gerais, com foco em excursões e experiências de viagem planejadas com organização e segurança.',
+  slogan: 'Viagens e experiências.',
+  homeMainText:
+    'Conectamos você aos melhores roteiros, praias e experiências turísticas com saída organizada da região do Vale do Aço, Minas Gerais.',
+  aboutText:
+    'A SonheTur atua no segmento de agência de viagens e turismo na região do Vale do Aço, Minas Gerais, com foco em excursões e experiências de viagem planejadas com organização e segurança.',
   mission: '',
   vision: '',
   values: '',
@@ -44,6 +47,16 @@ interface LocalClientStore {
   content: InstitutionalContent;
   contacts: ContactRequest[];
   adminConfigured?: boolean;
+  adminPasswordHash?: string;
+}
+
+function computeStats(travels: Travel[], contacts: ContactRequest[]): DashboardStats {
+  return {
+    publishedCount: travels.filter((t) => t.status === 'Publicada').length,
+    draftCount: travels.filter((t) => t.status === 'Rascunho').length,
+    closedCount: travels.filter((t) => t.status === 'Encerrada').length,
+    contactRequestsCount: contacts.length,
+  };
 }
 
 function getLocalStore(): LocalClientStore {
@@ -52,13 +65,14 @@ function getLocalStore(): LocalClientStore {
     if (raw) {
       const parsed = JSON.parse(raw);
       return {
-        travels: parsed.travels || [],
-        destinations: parsed.destinations || [],
-        banners: parsed.banners || [],
+        travels: Array.isArray(parsed.travels) ? parsed.travels : [],
+        destinations: Array.isArray(parsed.destinations) ? parsed.destinations : [],
+        banners: Array.isArray(parsed.banners) ? parsed.banners : [],
         settings: { ...defaultClientSettings, ...(parsed.settings || {}) },
         content: { ...defaultClientContent, ...(parsed.content || {}) },
-        contacts: parsed.contacts || [],
-        adminConfigured: parsed.adminConfigured ?? false,
+        contacts: Array.isArray(parsed.contacts) ? parsed.contacts : [],
+        adminConfigured: Boolean(parsed.adminConfigured),
+        adminPasswordHash: parsed.adminPasswordHash || '',
       };
     }
   } catch {
@@ -72,6 +86,7 @@ function getLocalStore(): LocalClientStore {
     content: { ...defaultClientContent },
     contacts: [],
     adminConfigured: false,
+    adminPasswordHash: '',
   };
 }
 
@@ -80,6 +95,55 @@ function saveLocalStore(store: LocalClientStore): void {
     localStorage.setItem(OFFLINE_STORE_KEY, JSON.stringify(store));
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Standard client-side SHA-256 hash for secure local admin authentication
+ */
+async function hashPasswordClient(password: string): Promise<string> {
+  const salt = 'sonhetur_vale_do_aco_2026';
+  try {
+    if (typeof window !== 'undefined' && window.crypto && window.crypto.subtle) {
+      const encoder = new TextEncoder();
+      const data = encoder.encode(password + ':' + salt);
+      const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // subtle crypto fallback
+  }
+  let h = 0x811c9dc5;
+  const str = password + ':' + salt;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return ('0000000' + (h >>> 0).toString(16)).slice(-8);
+}
+
+/**
+ * Safe fetch helper that strictly checks for JSON response content-type
+ * before attempting to parse. Prevents DOMException / SyntaxError:
+ * "The string did not match the expected pattern" when hosted statically on GitHub Pages.
+ */
+async function safeFetchJson(url: string, options?: RequestInit): Promise<{ ok: boolean; status: number; data: any }> {
+  try {
+    const res = await fetch(url, options);
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!contentType.includes('application/json')) {
+      return { ok: false, status: res.status, data: null };
+    }
+    const text = await res.text();
+    const trimmed = text.trim();
+    if (!trimmed || (!trimmed.startsWith('{') && !trimmed.startsWith('['))) {
+      return { ok: false, status: res.status, data: null };
+    }
+    const data = JSON.parse(trimmed);
+    return { ok: res.ok, status: res.status, data };
+  } catch {
+    return { ok: false, status: 0, data: null };
   }
 }
 
@@ -125,15 +189,19 @@ class RestApiDataProvider implements IDataProvider {
   }
 
   async getPublicData(): Promise<PublicDataResponse> {
-    try {
-      const res = await fetch('/api/public/data');
-      if (res.ok) {
-        return await res.json();
-      }
-    } catch {
-      // Fallback to local offline store when hosted statically (e.g. GitHub Pages)
+    const apiRes = await safeFetchJson('/api/public/data');
+    if (apiRes.ok && apiRes.data) {
+      const store = getLocalStore();
+      store.travels = apiRes.data.travels || store.travels;
+      store.destinations = apiRes.data.destinations || store.destinations;
+      store.banners = apiRes.data.banners || store.banners;
+      store.settings = { ...store.settings, ...(apiRes.data.settings || {}) };
+      store.content = { ...store.content, ...(apiRes.data.content || {}) };
+      saveLocalStore(store);
+      return apiRes.data;
     }
 
+    // Static hosting fallback (e.g. GitHub Pages)
     const store = getLocalStore();
     return {
       travels: store.travels.filter((t) => t.status === 'Publicada'),
@@ -153,19 +221,16 @@ class RestApiDataProvider implements IDataProvider {
     travelId?: string;
     travelTitle?: string;
   }): Promise<{ success: boolean; message: string }> {
-    try {
-      const res = await fetch('/api/public/contact', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(req),
-      });
-      if (res.ok) {
-        return await res.json();
-      }
-    } catch {
-      // Fallback for static deployment
+    const apiRes = await safeFetchJson('/api/public/contact', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(req),
+    });
+    if (apiRes.ok && apiRes.data) {
+      return apiRes.data;
     }
 
+    // Static hosting fallback
     const store = getLocalStore();
     const newContact: ContactRequest = {
       id: 'contact_' + Date.now(),
@@ -189,39 +254,91 @@ class RestApiDataProvider implements IDataProvider {
   }
 
   async checkAuthStatus(): Promise<{ configured: boolean; email: string }> {
-    const res = await fetch('/api/auth/status');
-    if (!res.ok) {
-      throw new Error('Falha ao verificar status de autenticação.');
+    const apiRes = await safeFetchJson('/api/auth/status');
+    if (apiRes.ok && apiRes.data) {
+      return apiRes.data;
     }
-    return res.json();
+
+    // Static hosting check
+    const store = getLocalStore();
+    const hasPassword = Boolean(store.adminConfigured && store.adminPasswordHash);
+    return {
+      configured: hasPassword,
+      email: 'sonhetur@gmail.com',
+    };
   }
 
   async setupInitialPassword(password: string): Promise<{ success: boolean; token: string; user: AdminUser }> {
-    const res = await fetch('/api/auth/setup-password', {
+    const apiRes = await safeFetchJson('/api/auth/setup-password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Erro ao configurar senha.');
+    if (apiRes.ok && apiRes.data && apiRes.data.token) {
+      sessionStorage.setItem(TOKEN_KEY, apiRes.data.token);
+      return apiRes.data;
     }
-    sessionStorage.setItem(TOKEN_KEY, data.token);
-    return data;
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    // Client-side initialization for static hosting
+    const hash = await hashPasswordClient(password);
+    const store = getLocalStore();
+    store.adminConfigured = true;
+    store.adminPasswordHash = hash;
+    saveLocalStore(store);
+
+    const token = 'client_token_' + Date.now();
+    sessionStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(TOKEN_KEY, token);
+
+    return {
+      success: true,
+      token,
+      user: { email: 'sonhetur@gmail.com', role: 'admin' },
+    };
   }
 
   async login(email: string, password: string): Promise<{ success: boolean; token: string; user: AdminUser }> {
-    const res = await fetch('/api/auth/login', {
+    const apiRes = await safeFetchJson('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      throw new Error(data.error || 'Falha ao realizar login.');
+
+    if (apiRes.ok && apiRes.data && apiRes.data.token) {
+      sessionStorage.setItem(TOKEN_KEY, apiRes.data.token);
+      return apiRes.data;
     }
-    sessionStorage.setItem(TOKEN_KEY, data.token);
-    return data;
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    // Client-side authentication fallback (GitHub Pages)
+    const store = getLocalStore();
+    if (!store.adminConfigured || !store.adminPasswordHash) {
+      throw new Error('Senha administrativa ainda não configurada no site. Por favor, crie sua senha de primeiro acesso.');
+    }
+
+    if (email.trim().toLowerCase() !== 'sonhetur@gmail.com') {
+      throw new Error('E-mail administrativo não autorizado. Utilize sonhetur@gmail.com');
+    }
+
+    const calculatedHash = await hashPasswordClient(password);
+    if (calculatedHash !== store.adminPasswordHash) {
+      throw new Error('Senha incorreta. Verifique sua senha e tente novamente.');
+    }
+
+    const token = 'client_token_' + Date.now();
+    sessionStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(TOKEN_KEY, token);
+
+    return {
+      success: true,
+      token,
+      user: { email: 'sonhetur@gmail.com', role: 'admin' },
+    };
   }
 
   async validateSession(): Promise<{ authenticated: boolean; user: AdminUser }> {
@@ -229,19 +346,22 @@ class RestApiDataProvider implements IDataProvider {
     if (!token) {
       return { authenticated: false, user: { email: '', role: '' } };
     }
-    try {
-      const res = await fetch('/api/auth/me', {
-        headers: this.getAuthHeader(),
-      });
-      if (!res.ok) {
-        sessionStorage.removeItem(TOKEN_KEY);
-        return { authenticated: false, user: { email: '', role: '' } };
-      }
-      const data = await res.json();
-      return { authenticated: true, user: data.user };
-    } catch {
-      return { authenticated: false, user: { email: '', role: '' } };
+
+    const apiRes = await safeFetchJson('/api/auth/me', {
+      headers: this.getAuthHeader(),
+    });
+    if (apiRes.ok && apiRes.data && apiRes.data.user) {
+      return { authenticated: true, user: apiRes.data.user };
     }
+
+    if (token.startsWith('client_token_')) {
+      const store = getLocalStore();
+      if (store.adminConfigured) {
+        return { authenticated: true, user: { email: 'sonhetur@gmail.com', role: 'admin' } };
+      }
+    }
+
+    return { authenticated: false, user: { email: '', role: '' } };
   }
 
   async getCurrentUser(): Promise<AdminUser | null> {
@@ -251,7 +371,7 @@ class RestApiDataProvider implements IDataProvider {
 
   async logout(): Promise<void> {
     try {
-      await fetch('/api/auth/logout', {
+      await safeFetchJson('/api/auth/logout', {
         method: 'POST',
         headers: this.getAuthHeader(),
       });
@@ -264,25 +384,56 @@ class RestApiDataProvider implements IDataProvider {
   }
 
   async getAdminData(): Promise<AdminDataResponse> {
-    const res = await fetch('/api/admin/data', {
+    const apiRes = await safeFetchJson('/api/admin/data', {
       headers: this.getAuthHeader(),
     });
-    if (!res.ok) {
-      if (res.status === 401) {
-        sessionStorage.removeItem(TOKEN_KEY);
-        throw new Error('UNAUTHORIZED');
-      }
-      throw new Error('Falha ao carregar painel administrativo.');
+    if (apiRes.ok && apiRes.data) {
+      const serverContacts = apiRes.data.contacts || apiRes.data.contactRequests || [];
+      const stats = apiRes.data.stats || computeStats(apiRes.data.travels || [], serverContacts);
+      const serverData: AdminDataResponse = {
+        travels: apiRes.data.travels || [],
+        destinations: apiRes.data.destinations || [],
+        banners: apiRes.data.banners || [],
+        settings: apiRes.data.settings || defaultClientSettings,
+        content: apiRes.data.content || defaultClientContent,
+        contacts: serverContacts,
+        contactRequests: serverContacts,
+        stats,
+      };
+      const store = getLocalStore();
+      store.travels = serverData.travels || store.travels;
+      store.destinations = serverData.destinations || store.destinations;
+      store.banners = serverData.banners || store.banners;
+      store.settings = { ...store.settings, ...(serverData.settings || {}) };
+      store.content = { ...store.content, ...(serverData.content || {}) };
+      store.contacts = serverData.contacts || store.contacts;
+      saveLocalStore(store);
+      return serverData;
     }
-    const data = await res.json();
+
+    if (apiRes.status === 401) {
+      sessionStorage.removeItem(TOKEN_KEY);
+      localStorage.removeItem(TOKEN_KEY);
+      throw new Error('UNAUTHORIZED');
+    }
+
+    // Static hosting store
+    const store = getLocalStore();
+    const stats = computeStats(store.travels, store.contacts);
     return {
-      ...data,
-      contactRequests: data.contacts || [],
+      travels: store.travels,
+      destinations: store.destinations,
+      banners: store.banners,
+      settings: store.settings,
+      content: store.content,
+      contacts: store.contacts || [],
+      contactRequests: store.contacts || [],
+      stats,
     };
   }
 
   async createTravel(data: Partial<Travel>): Promise<Travel> {
-    const res = await fetch('/api/admin/travels', {
+    const apiRes = await safeFetchJson('/api/admin/travels', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -290,13 +441,48 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao criar viagem.');
-    return result.travel;
+    if (apiRes.ok && apiRes.data && apiRes.data.travel) {
+      const store = getLocalStore();
+      store.travels.unshift(apiRes.data.travel);
+      saveLocalStore(store);
+      return apiRes.data.travel;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const newTravel: Travel = {
+      id: 'travel_' + Date.now(),
+      title: data.title || 'Nova Viagem',
+      destination: data.destination || '',
+      shortDescription: data.shortDescription || '',
+      fullDescription: data.fullDescription || '',
+      mainImage: data.mainImage || '',
+      gallery: data.gallery || [],
+      departureDate: data.departureDate || '',
+      returnDate: data.returnDate || '',
+      duration: data.duration || '',
+      boardingLocation: data.boardingLocation || '',
+      price: data.price || 0,
+      vacancies: data.vacancies || 0,
+      itinerary: data.itinerary || '',
+      included: data.included || [],
+      notIncluded: data.notIncluded || [],
+      importantInfo: data.importantInfo || '',
+      paymentMethods: data.paymentMethods || '',
+      observations: data.observations || '',
+      status: data.status || 'Rascunho',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    store.travels.unshift(newTravel);
+    saveLocalStore(store);
+    return newTravel;
   }
 
   async updateTravel(id: string, data: Partial<Travel>): Promise<Travel> {
-    const res = await fetch(`/api/admin/travels/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/travels/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -304,24 +490,46 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar viagem.');
-    return result.travel;
+    if (apiRes.ok && apiRes.data && apiRes.data.travel) {
+      const store = getLocalStore();
+      store.travels = store.travels.map((t) => (t.id === id ? apiRes.data.travel : t));
+      saveLocalStore(store);
+      return apiRes.data.travel;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const index = store.travels.findIndex((t) => t.id === id);
+    if (index === -1) {
+      throw new Error('Viagem não encontrada.');
+    }
+    const updated: Travel = {
+      ...store.travels[index],
+      ...data,
+      updatedAt: new Date().toISOString(),
+    };
+    store.travels[index] = updated;
+    saveLocalStore(store);
+    return updated;
   }
 
   async deleteTravel(id: string): Promise<void> {
-    const res = await fetch(`/api/admin/travels/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/travels/${id}`, {
       method: 'DELETE',
       headers: this.getAuthHeader(),
     });
-    if (!res.ok) {
-      const result = await res.json();
-      throw new Error(result.error || 'Erro ao excluir viagem.');
+    if (apiRes.data && apiRes.data.error && !apiRes.ok) {
+      throw new Error(apiRes.data.error);
     }
+    const store = getLocalStore();
+    store.travels = store.travels.filter((t) => t.id !== id);
+    saveLocalStore(store);
   }
 
   async createDestination(data: Partial<Destination>): Promise<Destination> {
-    const res = await fetch('/api/admin/destinations', {
+    const apiRes = await safeFetchJson('/api/admin/destinations', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -329,13 +537,31 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao criar destino.');
-    return result.destination;
+    if (apiRes.ok && apiRes.data && apiRes.data.destination) {
+      const store = getLocalStore();
+      store.destinations.unshift(apiRes.data.destination);
+      saveLocalStore(store);
+      return apiRes.data.destination;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const newDest: Destination = {
+      id: 'dest_' + Date.now(),
+      name: data.name || '',
+      description: data.description || '',
+      image: data.image || '',
+      createdAt: new Date().toISOString(),
+    };
+    store.destinations.unshift(newDest);
+    saveLocalStore(store);
+    return newDest;
   }
 
   async updateDestination(id: string, data: Partial<Destination>): Promise<Destination> {
-    const res = await fetch(`/api/admin/destinations/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/destinations/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -343,24 +569,42 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar destino.');
-    return result.destination;
+    if (apiRes.ok && apiRes.data && apiRes.data.destination) {
+      const store = getLocalStore();
+      store.destinations = store.destinations.map((d) => (d.id === id ? apiRes.data.destination : d));
+      saveLocalStore(store);
+      return apiRes.data.destination;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const index = store.destinations.findIndex((d) => d.id === id);
+    if (index === -1) {
+      throw new Error('Destino não encontrado.');
+    }
+    const updated: Destination = { ...store.destinations[index], ...data };
+    store.destinations[index] = updated;
+    saveLocalStore(store);
+    return updated;
   }
 
   async deleteDestination(id: string): Promise<void> {
-    const res = await fetch(`/api/admin/destinations/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/destinations/${id}`, {
       method: 'DELETE',
       headers: this.getAuthHeader(),
     });
-    if (!res.ok) {
-      const result = await res.json();
-      throw new Error(result.error || 'Erro ao excluir destino.');
+    if (apiRes.data && apiRes.data.error && !apiRes.ok) {
+      throw new Error(apiRes.data.error);
     }
+    const store = getLocalStore();
+    store.destinations = store.destinations.filter((d) => d.id !== id);
+    saveLocalStore(store);
   }
 
   async createBanner(data: Partial<Banner>): Promise<Banner> {
-    const res = await fetch('/api/admin/banners', {
+    const apiRes = await safeFetchJson('/api/admin/banners', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -368,13 +612,35 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao criar banner.');
-    return result.banner;
+    if (apiRes.ok && apiRes.data && apiRes.data.banner) {
+      const store = getLocalStore();
+      store.banners.unshift(apiRes.data.banner);
+      saveLocalStore(store);
+      return apiRes.data.banner;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const newBanner: Banner = {
+      id: 'banner_' + Date.now(),
+      title: data.title || '',
+      subtitle: data.subtitle || '',
+      image: data.image || '',
+      buttonText: data.buttonText || '',
+      buttonLink: data.buttonLink || '',
+      active: data.active !== undefined ? data.active : true,
+      order: data.order || store.banners.length + 1,
+      createdAt: new Date().toISOString(),
+    };
+    store.banners.unshift(newBanner);
+    saveLocalStore(store);
+    return newBanner;
   }
 
   async updateBanner(id: string, data: Partial<Banner>): Promise<Banner> {
-    const res = await fetch(`/api/admin/banners/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/banners/${id}`, {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -382,24 +648,40 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar banner.');
-    return result.banner;
+    if (apiRes.ok && apiRes.data && apiRes.data.banner) {
+      const store = getLocalStore();
+      store.banners = store.banners.map((b) => (b.id === id ? apiRes.data.banner : b));
+      saveLocalStore(store);
+      return apiRes.data.banner;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const index = store.banners.findIndex((b) => b.id === id);
+    if (index === -1) throw new Error('Banner não encontrado.');
+    const updated: Banner = { ...store.banners[index], ...data };
+    store.banners[index] = updated;
+    saveLocalStore(store);
+    return updated;
   }
 
   async deleteBanner(id: string): Promise<void> {
-    const res = await fetch(`/api/admin/banners/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/banners/${id}`, {
       method: 'DELETE',
       headers: this.getAuthHeader(),
     });
-    if (!res.ok) {
-      const result = await res.json();
-      throw new Error(result.error || 'Erro ao excluir banner.');
+    if (apiRes.data && apiRes.data.error && !apiRes.ok) {
+      throw new Error(apiRes.data.error);
     }
+    const store = getLocalStore();
+    store.banners = store.banners.filter((b) => b.id !== id);
+    saveLocalStore(store);
   }
 
   async updateSettings(data: Partial<SiteSettings>): Promise<SiteSettings> {
-    const res = await fetch('/api/admin/settings', {
+    const apiRes = await safeFetchJson('/api/admin/settings', {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -407,13 +689,24 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar configurações.');
-    return result.settings;
+    if (apiRes.ok && apiRes.data && apiRes.data.settings) {
+      const store = getLocalStore();
+      store.settings = apiRes.data.settings;
+      saveLocalStore(store);
+      return apiRes.data.settings;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    store.settings = { ...store.settings, ...data };
+    saveLocalStore(store);
+    return store.settings;
   }
 
   async updateContent(data: Partial<InstitutionalContent>): Promise<InstitutionalContent> {
-    const res = await fetch('/api/admin/content', {
+    const apiRes = await safeFetchJson('/api/admin/content', {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -421,13 +714,24 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify(data),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar conteúdo.');
-    return result.content;
+    if (apiRes.ok && apiRes.data && apiRes.data.content) {
+      const store = getLocalStore();
+      store.content = apiRes.data.content;
+      saveLocalStore(store);
+      return apiRes.data.content;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    store.content = { ...store.content, ...data };
+    saveLocalStore(store);
+    return store.content;
   }
 
   async updateContactStatus(id: string, status: ContactRequestStatus): Promise<ContactRequest> {
-    const res = await fetch(`/api/admin/contacts/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/contacts/${id}`, {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -435,24 +739,40 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify({ status }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao atualizar contato.');
-    return result.contact;
+    if (apiRes.ok && apiRes.data && apiRes.data.contact) {
+      const store = getLocalStore();
+      store.contacts = store.contacts.map((c) => (c.id === id ? apiRes.data.contact : c));
+      saveLocalStore(store);
+      return apiRes.data.contact;
+    }
+    if (apiRes.data && apiRes.data.error) {
+      throw new Error(apiRes.data.error);
+    }
+
+    const store = getLocalStore();
+    const index = store.contacts.findIndex((c) => c.id === id);
+    if (index === -1) throw new Error('Contato não encontrado.');
+    const updated: ContactRequest = { ...store.contacts[index], status };
+    store.contacts[index] = updated;
+    saveLocalStore(store);
+    return updated;
   }
 
   async deleteContact(id: string): Promise<void> {
-    const res = await fetch(`/api/admin/contacts/${id}`, {
+    const apiRes = await safeFetchJson(`/api/admin/contacts/${id}`, {
       method: 'DELETE',
       headers: this.getAuthHeader(),
     });
-    if (!res.ok) {
-      const result = await res.json();
-      throw new Error(result.error || 'Erro ao excluir contato.');
+    if (apiRes.data && apiRes.data.error && !apiRes.ok) {
+      throw new Error(apiRes.data.error);
     }
+    const store = getLocalStore();
+    store.contacts = store.contacts.filter((c) => c.id !== id);
+    saveLocalStore(store);
   }
 
   async updatePassword(newPassword: string): Promise<void> {
-    const res = await fetch('/api/admin/password', {
+    const apiRes = await safeFetchJson('/api/admin/password', {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -460,12 +780,17 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify({ newPassword }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao alterar senha.');
+    if (apiRes.ok) return;
+    if (apiRes.data && apiRes.data.error) throw new Error(apiRes.data.error);
+
+    const store = getLocalStore();
+    store.adminPasswordHash = await hashPasswordClient(newPassword);
+    store.adminConfigured = true;
+    saveLocalStore(store);
   }
 
   async changePassword(currentPassword: string, newPassword: string): Promise<void> {
-    const res = await fetch('/api/admin/password', {
+    const apiRes = await safeFetchJson('/api/admin/password', {
       method: 'PUT',
       headers: {
         'Content-Type': 'application/json',
@@ -473,8 +798,19 @@ class RestApiDataProvider implements IDataProvider {
       },
       body: JSON.stringify({ currentPassword, newPassword }),
     });
-    const result = await res.json();
-    if (!res.ok) throw new Error(result.error || 'Erro ao alterar senha.');
+    if (apiRes.ok) return;
+    if (apiRes.data && apiRes.data.error) throw new Error(apiRes.data.error);
+
+    const store = getLocalStore();
+    if (store.adminPasswordHash) {
+      const currentHash = await hashPasswordClient(currentPassword);
+      if (currentHash !== store.adminPasswordHash) {
+        throw new Error('Senha atual incorreta.');
+      }
+    }
+    store.adminPasswordHash = await hashPasswordClient(newPassword);
+    store.adminConfigured = true;
+    saveLocalStore(store);
   }
 }
 
