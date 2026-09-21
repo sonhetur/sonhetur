@@ -1,0 +1,6 @@
+{
+  "name": "SonheTur",
+  "description": "SonheTur — encontre sua próxima experiência de viagem. Agência de viagens e turismo no Vale do Aço, Minas Gerais.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
